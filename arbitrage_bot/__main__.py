@@ -4,9 +4,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+from pathlib import Path
 
 from .config import load_config
 from .engine import Engine
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Charge les lignes CLE=valeur du fichier .env sans écraser l'environnement existant."""
+    env = Path(path)
+    if not env.exists():
+        return
+    for line in env.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            if value.strip():
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def main() -> None:
@@ -15,6 +30,7 @@ def main() -> None:
     p.add_argument("--mode", choices=["demo", "paper", "live"], help="écrase engine.mode du YAML")
     p.add_argument("--duration", type=float, help="durée d'exécution en secondes (défaut : infini)")
     args = p.parse_args()
+    load_dotenv()
 
     cfg = load_config(args.config)
     if args.mode:

@@ -62,6 +62,14 @@ class RiskConfig:
 
 
 @dataclass
+class TelegramConfig:
+    enabled: bool = False                 # jeton et chat_id lus dans .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)
+    notify_trades: bool = True            # un message par trade exécuté
+    min_abs_pnl: float = 0.0              # n'envoie que les trades dont |profit| >= ce montant (les échecs toujours)
+    send_interval: float = 1.1            # secondes entre deux envois (limite Telegram ~1/s)
+
+
+@dataclass
 class EngineConfig:
     mode: str = "paper"                   # paper | live | demo
     tick_interval: float = 0.25
@@ -79,6 +87,7 @@ class BotConfig:
     funding: FundingConfig
     risk: RiskConfig
     engine: EngineConfig
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
 
     def exchange(self, name: str) -> ExchangeConfig:
         return next(e for e in self.exchanges if e.name == name)
@@ -106,4 +115,5 @@ def load_config(path: str | Path) -> BotConfig:
         funding=_build(FundingConfig, raw.get("funding")),
         risk=_build(RiskConfig, raw.get("risk")),
         engine=_build(EngineConfig, raw.get("engine")),
+        telegram=_build(TelegramConfig, raw.get("telegram")),
     )

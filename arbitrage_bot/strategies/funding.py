@@ -67,7 +67,8 @@ def scan(cfg: BotConfig, books: dict, funding_rates: dict, open_keys: set,
                 edge=ret,
                 meta={"annualized": annual, "funding_rate": rate, "leverage": fc.leverage},
             ))
-    return out
+    out.sort(key=lambda o: o.meta["annualized"], reverse=True)
+    return out[:fc.max_positions - len(open_keys)]
 
 
 def should_exit(funding_rate: float, cfg: BotConfig) -> bool:

@@ -67,3 +67,11 @@ risk:
   max_consecutive_failures: 6
   failure_cooldown: 30       # reprise automatique 30 s après le disjoncteur
   max_leg_imbalance: 0.02
+
+# Notifications Telegram : un message par trade + récapitulatif (capital, PnL du jour, par stratégie).
+# Jeton et chat_id dans .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — voir README.
+telegram:
+  enabled: true
+  notify_trades: true
+  min_abs_pnl: 0.0        # ex. 1.0 pour ne recevoir que les trades à ±1 USDT ou plus (les échecs sont toujours envoyés)
+  send_interval: 1.1      # limite Telegram ~1 message/s ; les rafales sont regroupées dans un même message

@@ -153,3 +153,17 @@ def test_shipped_config_loads():
     cfg = load_config("config/aggressive.yaml")
     assert cfg.engine.mode == "paper"
     assert cfg.risk.daily_loss_limit > 0
+
+
+def test_funding_scan_respects_max_positions():
+    cfg = make_cfg()
+    cfg.funding.symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    cfg.funding.max_positions = 2
+    books, rates = {}, {}
+    for i, sym in enumerate(cfg.funding.symbols):
+        books[("a", sym)] = {"bids": [(99.9, 5)], "asks": [(100, 5)]}
+        books[("a", sym + ":USDT")] = {"bids": [(100.05, 5)], "asks": [(100.1, 5)]}
+        rates[("a", sym + ":USDT")] = 0.001 * (i + 1)
+    opps = funding.scan(cfg, books, rates, set(), 1_000)
+    assert [o.legs[0].symbol for o in opps] == ["SOL/USDT", "ETH/USDT"]   # les meilleurs d'abord
+    assert len(funding.scan(cfg, books, rates, {("a", "SOL/USDT")}, 1_000)) == 1

@@ -6,10 +6,12 @@ import logging
 import random
 import time
 from collections import Counter, defaultdict
+from datetime import date
 
 from .config import BotConfig
 from .exchanges import CcxtVenue, SyntheticVenue, Venue
 from .execution import Executor, Result
+from .notifier import TelegramNotifier, fmt_num, fmt_signed, format_recap, format_trade
 from .rebalancer import rebalance
 from .risk import RiskManager
 from .strategies import Leg, Opportunity, cross_exchange, funding, triangular
@@ -33,10 +35,13 @@ class Engine:
         self.cycles: dict[str, list] = {}
         self.funding_rates: dict[tuple[str, str], float] = {}
         self.funding_positions: dict[tuple[str, str], dict] = {}
+        self.funding_pending: set[tuple[str, str]] = set()   # entrées en cours d'exécution
         self.balances: dict[str, dict[str, float]] = {}
         self.pnl_by_strategy: Counter = Counter()
         self.trades_by_strategy: Counter = Counter()
         self.missed: Counter = Counter()
+        self.notifier = TelegramNotifier(cfg.telegram)
+        self.trades_today, self.trades_day = 0, date.today()
         self.tasks: set[asyncio.Task] = set()
         self.rng = random.Random(42)
         self.stop = asyncio.Event()
@@ -143,20 +148,29 @@ class Engine:
         for key, pos in list(self.funding_positions.items()):
             ex, spot = key
             rate = self.funding_rates.get((ex, funding.perp_symbol(spot)), 0.0)
-            accrued = rate * pos["qty"] * pos["price"] * (now - pos["last"]) / (8 * 3600)
+            accrued = rate * pos["perp_qty"] * pos["price"] * (now - pos["last"]) / (8 * 3600)
             pos["last"] = now
             self._book_pnl("funding", accrued)
             if funding.should_exit(rate, self.cfg):
                 log.info("Sortie cash-and-carry %s %s (funding %.4f%%)", ex, spot, rate * 100)
                 ex_ = Executor(self.cfg, self.venues)
                 opp = pos["opp"]
-                closing = tuple(Leg(l.exchange, l.symbol, "sell" if l.side == "buy" else "buy",
-                                            l.amount, 0.0, l.market_type) for l in opp.legs)
+                closing = tuple(
+                    Leg(l.exchange, l.symbol, "sell" if l.side == "buy" else "buy",
+                        pos["spot_qty"] if l.side == "buy" else pos["perp_qty"], 0.0, l.market_type)
+                    for l in opp.legs)
                 fills = [await ex_._aggressive(l.exchange, l.symbol, l.side, l.amount, l.market_type)
-                         for l in closing]
+                         for l in closing if l.amount > 0]
+                closing = tuple(l for l in closing if l.amount > 0)
                 exit_pnl = Executor._quote_pnl(list(zip(closing, fills)))
-                self._book_pnl("funding", exit_pnl + pos["entry_perp"] - pos["entry_spot"])
+                realized = exit_pnl + pos["entry_perp"] - pos["entry_spot"]
+                self._book_pnl("funding", realized)
                 del self.funding_positions[key]
+                self.notifier.notify(
+                    f"🔚 <b>Sortie cash-and-carry</b> — {spot} sur {ex}\n"
+                    f"Funding retombé à {funding.annualize(rate) * 100:.1f} %/an\n"
+                    f"Résultat de la sortie : <b>{fmt_signed(realized)} USDT</b>\n"
+                    f"━━━━━━━━━━\n{format_recap(self.recap())}")
 
     # ------------------------------------------------------------------ trading
     def _book_pnl(self, strategy: str, pnl: float) -> None:
@@ -170,10 +184,17 @@ class Engine:
         return (
             cross_exchange.scan(self.cfg, books, self.balances, budget)
             + triangular.scan(self.cfg, books, self.cycles, self.balances, budget)
-            + funding.scan(self.cfg, books, self.funding_rates, set(self.funding_positions), budget)
+            + funding.scan(self.cfg, books, self.funding_rates,
+                           set(self.funding_positions) | self.funding_pending, budget)
         )
 
     async def _run(self, opp: Opportunity) -> None:
+        try:
+            await self._execute(opp)
+        finally:
+            self.funding_pending.discard((opp.legs[0].exchange, opp.legs[0].symbol))
+
+    async def _execute(self, opp: Opportunity) -> None:
         try:
             result: Result = await Executor(self.cfg, self.venues).execute(opp)
         except Exception:
@@ -185,23 +206,59 @@ class Engine:
             self.risk.close(opp, 0.0, True)
             return
         self.trades_by_strategy[opp.strategy] += 1
-        if opp.strategy == "funding" and result.ok:
-            # la position reste ouverte : on ne libère pas les carnets, on encaisse les frais d'entrée
-            spot = next(f for l, f in result.fills if l.side == "buy")
-            perp = next(f for l, f in result.fills if l.side == "sell")
+        if date.today() != self.trades_day:
+            self.trades_today, self.trades_day = 0, date.today()
+        self.trades_today += 1
+        if opp.strategy == "funding":
+            # la position reste ouverte (y compris quand une jambe a été complétée en urgence) :
+            # on la suit jusqu'à la sortie ; à l'entrée seuls les frais sont une perte
+            buys = [f for l, f in result.fills if l.side == "buy"]
+            sells = [f for l, f in result.fills if l.side == "sell"]
             self.funding_positions[(opp.legs[0].exchange, opp.legs[0].symbol)] = {
-                "opp": opp, "qty": spot.filled, "price": spot.avg_price,
-                "entry_spot": spot.notional, "entry_perp": perp.notional, "last": time.time()}
+                "opp": opp, "spot_qty": sum(f.filled for f in buys), "perp_qty": sum(f.filled for f in sells),
+                "price": opp.legs[0].price, "entry_spot": sum(f.notional for f in buys),
+                "entry_perp": sum(f.notional for f in sells), "last": time.time()}
             self.risk.park(opp)
-            # à l'entrée seuls les frais sont une perte : le spot acheté reste un actif
-            self._book_pnl("funding", -sum(f.fee_quote for _, f in result.fills))
+            fees = -sum(f.fee_quote for _, f in result.fills)
+            self._book_pnl("funding", fees)
             log.info("Entrée cash-and-carry %s annualisé=%.1f%%", opp.legs[0].symbol,
                      opp.meta["annualized"] * 100)
+            if self.notifier.should_notify_trade(fees, result.ok):
+                self.notifier.notify(format_trade(
+                    opp.strategy, result.fills, opp.expected_profit, fees, opp.edge, opp.notional, result.ok,
+                    self.recap(), entry=True,
+                    extra=f"📌 Position ouverte · rendement visé {opp.meta['annualized'] * 100:.1f} %/an "
+                          f"(le funding est versé toutes les 8 h)"))
             return
         self.pnl_by_strategy[opp.strategy] += result.pnl
+        halted_before = self.risk.halted_reason
         self.risk.close(opp, result.pnl, result.ok)
+        if self.notifier.should_notify_trade(result.pnl, result.ok):
+            self.notifier.notify(format_trade(opp.strategy, result.fills, opp.expected_profit, result.pnl,
+                                              opp.edge, opp.notional, result.ok, self.recap()))
+        if self.risk.halted_reason and self.risk.halted_reason != halted_before:
+            self._notify_halt()
         log.info("%-14s edge=%.3f%% attendu=%.2f réalisé=%.2f %s", opp.strategy, opp.edge * 100,
                  opp.expected_profit, result.pnl, "OK" if result.ok else "ÉCHEC")
+
+    def recap(self) -> dict:
+        eq = self.risk.equity
+        return {
+            "equity": eq,
+            "return_pct": (eq / self.cfg.risk.starting_equity - 1) * 100,
+            "daily_pnl": self.risk.daily_pnl,
+            "trades_today": self.trades_today,
+            "pnl_by_strategy": {s: self.pnl_by_strategy[s] for s in ("cross_exchange", "triangular", "funding")},
+        }
+
+    def _notify_halt(self) -> None:
+        if self.risk.halted_reason == "daily_loss":
+            text = (f"🛑 <b>KILL SWITCH</b> : perte du jour {fmt_signed(self.risk.daily_pnl)} USDT.\n"
+                    f"Trading suspendu jusqu'à demain.")
+        else:
+            text = (f"⏸ <b>Disjoncteur</b> : {self.risk.consecutive_failures} échecs d'exécution consécutifs.\n"
+                    f"Pause de {self.cfg.risk.failure_cooldown:.0f} s.")
+        self.notifier.notify(f"{text}\n━━━━━━━━━━\n{format_recap(self.recap())}")
 
     def report(self) -> None:
         eq, start = self.risk.equity, self.cfg.risk.starting_equity
@@ -223,6 +280,13 @@ class Engine:
         if self.mode in ("paper", "demo"):
             await self._seed_paper_wallets()
         self.risk.day_start_equity = self.risk.equity
+        self.notifier.start()
+        strategies = [n for n, c in (("inter-plateformes", self.cfg.cross_exchange), ("triangulaire", self.cfg.triangular),
+                                     ("funding", self.cfg.funding)) if c.enabled]
+        self.notifier.notify(f"🚀 <b>Robot démarré</b> (mode {self.mode})\n"
+                             f"Plateformes : {', '.join(self.venues)}\n"
+                             f"Stratégies : {', '.join(strategies)}\n"
+                             f"Capital : {fmt_num(self.risk.equity)} USDT")
 
         deadline = time.monotonic() + duration if duration else None
         last_funding = last_rebalance = last_report = 0.0
@@ -237,6 +301,8 @@ class Engine:
                     last_funding = tick
                 for opp in self.risk.select(self.scan()):
                     self.risk.open(opp)
+                    if opp.strategy == "funding":
+                        self.funding_pending.add((opp.legs[0].exchange, opp.legs[0].symbol))
                     t = asyncio.create_task(self._run(opp))
                     self.tasks.add(t)
                     t.add_done_callback(self.tasks.discard)
@@ -266,3 +332,5 @@ class Engine:
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await asyncio.gather(*(v.close() for v in self.venues.values()), return_exceptions=True)
         self.report()
+        self.notifier.notify(f"⏹ <b>Robot arrêté</b>\n{format_recap(self.recap())}")
+        await self.notifier.close()
