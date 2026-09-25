@@ -1,0 +1,69 @@
+# ============================================================================
+#  CONFIGURATION AGRESSIVE — maximisation du rendement
+#  Philosophie : beaucoup de plateformes, beaucoup de paires, seuils serrés,
+#  gros tickets, capital réinvesti en continu, levier sur le carry.
+#  Le kill switch reste actif : l'agressivité porte sur l'exposition, pas sur
+#  l'absence de filet.
+# ============================================================================
+
+engine:
+  mode: paper             # demo (hors ligne) | paper (données réelles, ordres simulés) | live
+  tick_interval: 0.1      # 10 scans par seconde
+  use_websocket: true     # flux ccxt.pro : latence divisée par ~10 vs REST
+  orderbook_depth: 25     # on exploite la profondeur, pas seulement le meilleur prix
+  paper_slippage: 0.0002
+  log_level: INFO
+
+# Frais taker aux paliers optimisés (remise token natif / VIP). Chaque 0,01 % gagné
+# sur les frais est directement du rendement : c'est LE levier n°1 de l'arbitrage.
+exchanges:
+  - {name: binance, taker_fee: 0.00075, maker_fee: 0.00075}   # remise BNB
+  - {name: bybit,   taker_fee: 0.0006,  maker_fee: 0.0004}
+  - {name: okx,     taker_fee: 0.0006,  maker_fee: 0.0004}
+  - {name: bitget,  taker_fee: 0.0008,  maker_fee: 0.0008}    # remise BGB
+  - {name: kucoin,  taker_fee: 0.0008,  maker_fee: 0.0008}    # remise KCS
+  - {name: gate,    taker_fee: 0.0009,  maker_fee: 0.0009}
+  - {name: mexc,    taker_fee: 0.0005,  maker_fee: 0.0}       # frais parmi les plus bas
+  - {name: htx,     taker_fee: 0.001,   maker_fee: 0.001}
+
+# 1) Arbitrage spatial : les écarts sont plus larges et plus fréquents sur les
+#    mid-caps volatiles que sur BTC/ETH, où la concurrence HFT est maximale.
+cross_exchange:
+  enabled: true
+  symbols: [BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT, DOGE/USDT, AVAX/USDT, LINK/USDT,
+            SUI/USDT, PEPE/USDT, WIF/USDT, TON/USDT, APT/USDT, ARB/USDT, OP/USDT, INJ/USDT]
+  min_edge: 0.0005        # 0,05 % net après frais suffit à déclencher
+  latency_buffer: 0.0002
+
+# 2) Triangulaire : seuil bas, univers large, sur les plateformes à frais bas.
+triangular:
+  enabled: true
+  exchanges: [binance, mexc, okx]
+  base_asset: USDT
+  universe: [BTC, ETH, BNB, SOL, XRP, DOGE, TRX, LINK, AVAX, TON, USDC, FDUSD]
+  concurrent: true        # 3 jambes simultanées financées par l'inventaire
+  min_edge: 0.0004
+  max_cycles: 400
+
+# 3) Cash-and-carry funding : moteur de rendement de fond, levier 3x sur la jambe perp.
+funding:
+  enabled: true
+  exchanges: [binance, bybit, okx, bitget]
+  symbols: [BTC/USDT, ETH/USDT, SOL/USDT, DOGE/USDT, PEPE/USDT, WIF/USDT, SUI/USDT]
+  min_annualized: 0.20    # entrée dès 20 %/an
+  exit_annualized: 0.03
+  leverage: 3.0
+  max_positions: 2          # 2 x 35 % du capital immobilisés au maximum dans le carry
+  expected_hold_periods: 9  # 3 jours pour amortir les 4 frais taker
+
+risk:
+  starting_equity: 10000
+  trade_fraction: 0.35       # 35 % du capital par trade
+  max_trade_notional: 100000
+  min_trade_notional: 15
+  max_concurrent_trades: 10
+  compounding: true          # chaque gain agrandit le trade suivant
+  daily_loss_limit: 0.06     # kill switch à -6 %/jour
+  max_consecutive_failures: 6
+  failure_cooldown: 30       # reprise automatique 30 s après le disjoncteur
+  max_leg_imbalance: 0.02
