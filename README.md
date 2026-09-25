@@ -9,7 +9,15 @@ sur jusqu'à 8 plateformes, avec une configuration taillée pour maximiser le re
 | `triangular` | USDT → X → Y → USDT sur une même plateforme, **3 jambes simultanées** financées par l'inventaire | incohérences entre paires croisées |
 | `funding` | Cash-and-carry : long spot + short perpétuel, delta neutre, **levier 3x** sur la jambe perp | funding rate payé toutes les 8 h |
 
-## Démarrage
+## Démarrage rapide (paper trading en un double-clic)
+
+- **Windows** : double-clic sur `lancer_paper.bat`
+- **Mac** : double-clic sur `lancer_paper.command` (la première fois : clic droit → Ouvrir)
+
+Le script installe les dépendances, crée le `.env` s'il manque, teste Telegram, puis démarre le
+paper trading (vrais prix, ordres simulés, aucune clé API de plateforme nécessaire).
+
+## Démarrage manuel
 
 ```bash
 pip install -r requirements.txt
