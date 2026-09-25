@@ -90,16 +90,29 @@ class Engine:
         if not self.venues:
             raise SystemExit("Aucune plateforme joignable : vérifie la connexion réseau (ou lance --mode demo).")
 
+    async def _wait_for_books(self, timeout: float = 45.0, target: float = 0.9) -> None:
+        """Attend que la plupart des carnets aient reçu une première mise à jour
+        (la connexion aux plateformes prend plusieurs secondes)."""
+        total = sum(len(s) for s in self.subscriptions.values()) or 1
+        start = time.monotonic()
+        while True:
+            ready = sum(1 for n, subs in self.subscriptions.items() for sym in subs if sym in self.venues[n].books)
+            if ready / total >= target or time.monotonic() - start > timeout:
+                log.info("Carnets reçus : %d/%d (%.0f s)", ready, total, time.monotonic() - start)
+                return
+            await asyncio.sleep(0.5)
+
     async def _seed_paper_wallets(self) -> None:
         """Répartit le capital de départ : 50 % en stable, 50 % en actifs de base, à parts égales."""
         prices = self._prices()
-        assets = {s.split(":")[0].split("/")[0] for subs in self.subscriptions.values() for s in subs} - STABLES
-        assets = {a for a in assets if a in prices}
         per_venue = self.cfg.risk.starting_equity / len(self.venues)
-        for venue in self.venues.values():
-            venue.wallet.balances["USDT"] = per_venue / 2
+        for name, venue in self.venues.items():
+            assets = {s.split(":")[0].split("/")[0] for s in self.subscriptions[name]} - STABLES
+            assets = {a for a in assets if a in prices}
+            venue.wallet.balances["USDT"] = per_venue / 2 if assets else per_venue
             for a in assets:
                 venue.wallet.balances[a] = per_venue / 2 / len(assets) / prices[a]
+            log.info("%s : portefeuille simulé de %.0f USDT (%d actifs)", name, per_venue, len(assets))
 
     def _prices(self) -> dict[str, float]:
         prices = {"USDT": 1.0, "USDC": 1.0}
@@ -260,6 +273,31 @@ class Engine:
                     f"Pause de {self.cfg.risk.failure_cooldown:.0f} s.")
         self.notifier.notify(f"{text}\n━━━━━━━━━━\n{format_recap(self.recap())}")
 
+    def _best_edges(self) -> str:
+        """Meilleurs écarts nets visibles sur le marché, même sous le seuil de déclenchement."""
+        books = self._fresh_books()
+        fees = {e.name: e.taker_fee for e in self.cfg.enabled_exchanges}
+        best, where = -1.0, ""
+        for symbol in self.cfg.cross_exchange.symbols:
+            venues = [ex for ex in self.venues if (ex, symbol) in books]
+            for a in venues:
+                for b in venues:
+                    asks, bids = books[(a, symbol)]["asks"], books[(b, symbol)]["bids"]
+                    if a == b or not asks or not bids:
+                        continue
+                    edge = bids[0][0] * (1 - fees[b]) / (asks[0][0] * (1 + fees[a])) - 1
+                    if edge > best:
+                        best, where = edge, f"{symbol} {a}→{b}"
+        parts = []
+        if where:
+            need = self.cfg.cross_exchange.min_edge + self.cfg.cross_exchange.latency_buffer
+            parts.append(f"meilleur écart inter {best * 100:+.3f}% ({where}, seuil {need * 100:.3f}%)")
+        if self.funding_rates:
+            (ex, sym), rate = max(self.funding_rates.items(), key=lambda kv: kv[1])
+            parts.append(f"meilleur funding {funding.annualize(rate) * 100:.1f}%/an ({sym.split(':')[0]} {ex}, "
+                         f"seuil {self.cfg.funding.min_annualized * 100:.0f}%)")
+        return " | ".join(parts)
+
     def report(self) -> None:
         eq, start = self.risk.equity, self.cfg.risk.starting_equity
         detail = " | ".join(f"{s}: {self.trades_by_strategy[s]} trades ({self.missed[s]} ratés), "
@@ -267,6 +305,9 @@ class Engine:
                             for s in ("cross_exchange", "triangular", "funding"))
         log.info("CAPITAL %.2f (%+.3f%%) | %s%s", eq, (eq / start - 1) * 100, detail,
                  f" | HALT: {self.risk.halted_reason}" if self.risk.halted_reason else "")
+        diag = self._best_edges()
+        if diag:
+            log.info("MARCHÉ  %s", diag)
 
     # ------------------------------------------------------------------ main loop
     async def run(self, duration: float | None = None) -> None:
@@ -276,7 +317,7 @@ class Engine:
                 self.tasks.add(asyncio.create_task(self._watch(self.venues[name], sym)))
         if self.mode == "demo":
             SyntheticVenue.step_reference(self.rng)
-        await asyncio.sleep(max(1.0, self.cfg.engine.tick_interval * 2))
+        await self._wait_for_books()
         if self.mode in ("paper", "demo"):
             await self._seed_paper_wallets()
         self.risk.day_start_equity = self.risk.equity
