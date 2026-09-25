@@ -50,7 +50,8 @@ Mise en place (2 minutes) :
 2. Envoie un message quelconque à ton nouveau bot.
 3. Ouvre `https://api.telegram.org/bot<TON_JETON>/getUpdates` dans un navigateur et copie
    `"chat":{"id": ...}` dans `TELEGRAM_CHAT_ID`.
-4. Lance le robot : le fichier `.env` est chargé automatiquement.
+4. Vérifie la configuration : `python -m arbitrage_bot --test-telegram` envoie un message de test
+   (le fichier `.env` est chargé automatiquement).
 
 Telegram limite l'envoi à ~1 message/s : quand plusieurs trades tombent en même temps, ils sont
 regroupés dans un seul message. Pour ne recevoir que les trades significatifs, règle
